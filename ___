@@ -1,0 +1,144 @@
+'use server';
+
+import type {ChangeLog} from '../types/changeLog';
+
+import { promises as fs } from 'fs';
+import SimpleGit from 'simple-git';
+
+const baseDir = './clearvisio/';
+const path = 'src/Migration/';
+const branch = 'changelog-editor-tests';
+
+const git = SimpleGit(baseDir);
+
+export async function onSave(newLog: ChangeLog): Promise<string | void> {
+  try {
+    await validateLog(newLog);
+    await refreshRepository();
+    await createAndSaveToFile(newLog);
+    await commitAndPushChanges(newLog.fileName);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function validateLog(log: ChangeLog) {
+  if (!log || log.content.replace(/(<([^>]+)>)/gi, '') == '') {
+    throw new Error("There's no content to save");
+  }
+  if (!log.locale || typeof log.locale != 'string') {
+    throw new Error('Locale not selected');
+  }
+}
+
+async function refreshRepository() {
+  try {
+    await git.fetch();
+    await git.rebase();
+  } catch (error) {
+    throw new Error('Refresh repository: ' + error);
+  }
+}
+
+async function createAndSaveToFile(log: ChangeLog) {
+  const fileContent =
+    `
+<?php
+namespace Clearvisio\\Migration;
+
+/*CHANGELOG:${btoa(JSON.stringify(log))}*/
+
+use Doctrine\\Migrations\\AbstractMigration;
+use Doctrine\\DBAL\\Schema\\Schema;
+class ${log.fileName.slice(0, -4)} extends AbstractMigration
+{
+    public function up(Schema $schema): void
+    {
+        $this->addSql(
+            'INSERT INTO permanent_notification(content_type, content, created, updated) VALUES(?, ?, NOW(), NOW())',
+            [
+                'changelog',
+                json_encode([
+                    'htmlContent' => ${JSON.stringify(log.content)}
+                ])
+            ]
+        );
+        $this->addSql(
+            '
+                INSERT INTO permanent_notification_user (notification_id, user_id, is_read, created, updated)
+                SELECT
+                    DISTINCT maxid.id,
+                    u.id,
+                    IF(ADDDATE(u.created, INTERVAL 10 MINUTE) < NOW(), 0, 1),
+                    NOW(),
+                    NOW()
+                FROM user u
+                INNER JOIN user_store_role usr ON usr.user_id = u.id
+                INNER JOIN store s ON usr.store_id = s.id
+                INNER JOIN chain c ON s.chain_id = c.id
+                INNER JOIN (SELECT MAX(id) as id FROM permanent_notification) AS maxid
+                WHERE c.language = ?
+            ',
+            [${JSON.stringify(log.locale)}]
+        );
+    }
+
+    public function down(Schema $schema): void {}
+}
+    `.trim();
+
+  await fs.writeFile(baseDir + path + log.fileName, fileContent);
+}
+
+async function commitAndPushChanges(fileName: string) {
+  try {
+    await git.add(path + fileName);
+    await git.commit('New change-log added: ' + fileName);
+    await git.push('origin', branch);
+  } catch (error) {
+    throw new Error('Commit and push changes: ' + error);
+  }
+}
+
+export async function getLogs() {
+  await refreshRepository();
+  const fileNames = await fs.readdir(baseDir + path);
+  const logs = await Promise.all(
+    fileNames.map(async (fileName) => await getLog(fileName))
+  );
+
+  return logs.filter((log) => log);
+}
+
+export async function getLog(fileName: string) {
+  if (fileName.indexOf('Version') != 0 ||
+      fileName.length != 'Version20191010100000.php'.length) {
+    return null;
+  }
+
+  const fileContent = await fs.readFile(baseDir + path + fileName, 'utf8');
+
+  const log64SearchString = '/*CHANGELOG:';
+  const log64Pos = fileContent.indexOf(log64SearchString) + log64SearchString.length;
+  if (log64Pos < log64SearchString.length) {
+    return getOldLog(fileName, fileContent);
+  }
+
+  return JSON.parse(atob(
+    fileContent.substring(log64Pos, fileContent.indexOf('*/', log64Pos))
+  ));
+}
+
+function getOldLog(fileName: string, fileContent: string) {
+  const localeSearchString = 'c.language = "';
+  const localePos = fileContent.indexOf(localeSearchString) + localeSearchString.length;
+
+  const contentSearchString = "'htmlContent' => '"
+  const contentPos = fileContent.indexOf(contentSearchString) + contentSearchString.length;
+
+  return {
+    locale: fileContent.substring(localePos, fileContent.indexOf('"', localePos)),
+    content: '* ' + fileContent.substring(contentPos, fileContent.indexOf("'", contentPos)),
+    fileName: fileName
+  };
+}
